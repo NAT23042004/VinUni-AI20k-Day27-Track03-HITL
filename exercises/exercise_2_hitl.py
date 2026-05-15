@@ -25,6 +25,8 @@ from common.schemas import (
     PRAnalysis,
     ReviewState,
 )
+from exercises.cli_resume import interactive_or_raise, scripted_approval_response
+from exercises.review_prompt import build_review_messages
 
 
 console = Console()
@@ -42,10 +44,11 @@ def node_analyze(state: ReviewState) -> dict:
     console.print("[cyan]→ analyze[/cyan]")
     llm = get_llm().with_structured_output(PRAnalysis)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
-        analysis = llm.invoke([
-            {"role": "system", "content": "Senior reviewer. Structured output."},
-            {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
-        ])
+        analysis = llm.invoke(build_review_messages(
+            pr_title=state["pr_title"],
+            pr_diff=state["pr_diff"],
+            include_escalation_questions=False,
+        ))
     console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.comments)} comment(s)")
     return {"analysis": analysis}
 
@@ -63,17 +66,19 @@ def node_route(state: ReviewState) -> dict:
 def node_human_approval(state: ReviewState) -> dict:
     """Pause and ask the human."""
     a = state["analysis"]
-    # TODO: call interrupt(payload) where payload contains these fields:
-    #         "kind": "approval_request",
-    #         "confidence": a.confidence,
-    #         "confidence_reasoning": a.confidence_reasoning,
-    #         "summary": a.summary,
-    #         "comments": [c.model_dump() for c in a.comments],
-    #         "diff_preview": state["pr_diff"][:2000],
-    # interrupt() returns whatever the caller passes via Command(resume=...).
-    # response = interrupt(...)
-    # return {"human_choice": response["choice"], "human_feedback": response.get("feedback")}
-    raise NotImplementedError("Call interrupt() with an approval_request payload")
+    response = interrupt({
+        "kind": "approval_request",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "comments": [c.model_dump() for c in a.comments],
+        "diff_preview": state["pr_diff"][:2000],
+    })
+    return {
+        "human_choice": response["choice"],
+        "human_feedback": response.get("feedback"),
+    }
 
 
 def _render_comment_body(state: ReviewState) -> str:
@@ -103,7 +108,8 @@ def node_commit(state: ReviewState) -> dict:
     if state.get("human_choice") == "approve":
         return {"final_action": _post(state, "committed")}
     console.print(f"  [yellow]·[/yellow] skipping comment (choice={state.get('human_choice')})")
-    return {"final_action": "rejected"}
+    action = "edit_requested" if state.get("human_choice") == "edit" else "rejected"
+    return {"final_action": action}
 
 
 def node_auto_approve(state):
@@ -133,8 +139,7 @@ def build_graph():
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
     g.add_edge("escalate", END)
-    # TODO: compile with checkpointer=MemorySaver()
-    return g.compile()
+    return g.compile(checkpointer=MemorySaver())
 
 
 def prompt_human(payload: dict) -> dict:
@@ -154,7 +159,7 @@ def prompt_human(payload: dict) -> dict:
     choice = ""
     while choice not in {"approve", "reject", "edit"}:
         choice = console.input("\n[bold]Choice (approve/reject/edit)?[/bold] ").strip().lower()
-    feedback = console.input("Feedback: ").strip() if choice != "approve" else ""
+    feedback = console.input("Feedback: ").strip() if choice in {"reject", "edit"} else ""
     return {"choice": choice, "feedback": feedback}
 
 
@@ -162,6 +167,8 @@ def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser()
     parser.add_argument("--pr", required=True)
+    parser.add_argument("--choice", choices=["approve", "reject", "edit"])
+    parser.add_argument("--feedback", default="")
     args = parser.parse_args()
 
     console.rule("[bold]Exercise 2 — HITL with interrupt()[/bold]")
@@ -174,12 +181,12 @@ def main() -> None:
 
     result = app.invoke({"pr_url": args.pr, "thread_id": thread_id}, cfg)
 
-    # TODO: write a `while "__interrupt__" in result:` loop:
-    #   - take payload from result["__interrupt__"][0].value
-    #   - call prompt_human(payload)
-    #   - resume with app.invoke(Command(resume=<answer>), cfg)
-    # while "__interrupt__" in result:
-    #     ...
+    while "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        resume_value = scripted_approval_response(args.choice, args.feedback)
+        if resume_value is None:
+            resume_value = interactive_or_raise(payload, prompt_human)
+        result = app.invoke(Command(resume=resume_value), cfg)
 
     console.rule("Done")
     console.print(result.get("final_action"))
